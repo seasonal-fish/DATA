@@ -1,0 +1,24 @@
+# 언론사 RSS 피드 목록 (httpx로 fetch -> feedparser로 파싱).
+# 등록 전 curl로 200 + 유효한 RSS/XML 본문인지 직접 확인한 주소만 넣었다.
+# (네이버 뉴스는 2020년 RSS 서비스가 종료되어 여기 포함하지 않음 -> news/naver_news_api.py 참고)
+#
+# 항목이 깨지면(404/HTML 응답 등) 주기적으로 점검해서 빼거나 새 주소로 교체할 것.
+feeds:
+  - name: 한겨레
+    url: https://www.hani.co.kr/rss/
+    category: total
+  - name: 연합뉴스
+    url: https://www.yna.co.kr/rss/news.xml
+    category: total
+  - name: 경향신문
+    url: http://www.khan.co.kr/rss/rssdata/total_news.xml
+    category: total
+  - name: 동아닷컴
+    url: http://rss.donga.com/total.xml
+    category: total
+  - name: 노컷뉴스
+    url: http://rss.nocutnews.co.kr/nocutnews.xml
+    category: total
+  - name: 시사IN
+    url: https://www.sisain.co.kr/rss/allArticle.xml
+    category: weekly_magazine
