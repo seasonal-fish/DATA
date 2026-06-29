@@ -16,6 +16,7 @@ sshtunnel로 로컬 포트를 RDS:5432로 포워딩한 뒤 psycopg2로 접속한
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import statistics
 import time
@@ -46,15 +47,49 @@ MAX_RETRIES = 3
 
 def load_env() -> dict:
     env = {**dotenv_values(ENV_PATH), **os.environ}
-    required = [
-        "SSH_HOST", "SSH_PORT", "SSH_USER", "SSH_PEM_PATH",
-        "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD",
-        "NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET",
-    ]
+    naver_required = ["NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET"]
+    if env.get("DATABASE_URL"):
+        required = naver_required
+    else:
+        required = [
+            "SSH_HOST", "SSH_PORT", "SSH_USER", "SSH_PEM_PATH",
+            "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD",
+            *naver_required,
+        ]
     missing = [k for k in required if not env.get(k)]
     if missing:
         raise RuntimeError(f"{ENV_PATH}에 다음 값이 없습니다: {missing}")
     return env
+
+
+@contextlib.contextmanager
+def connect_db(env: dict):
+    """DATABASE_URL이 있으면 직접 접속, 없으면 SSH 터널 경유."""
+    if env.get("DATABASE_URL"):
+        conn = psycopg2.connect(env["DATABASE_URL"])
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+
+    with SSHTunnelForwarder(
+        (env["SSH_HOST"], int(env["SSH_PORT"])),
+        ssh_username=env["SSH_USER"],
+        ssh_pkey=env["SSH_PEM_PATH"],
+        remote_bind_address=(env["DB_HOST"], int(env["DB_PORT"])),
+    ) as tunnel:
+        conn = psycopg2.connect(
+            host="127.0.0.1",
+            port=tunnel.local_bind_port,
+            dbname=env["DB_NAME"],
+            user=env["DB_USER"],
+            password=env["DB_PASSWORD"],
+        )
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def fetch_batch_averages(
@@ -116,19 +151,7 @@ def main() -> None:
         "Content-Type": "application/json",
     }
 
-    with SSHTunnelForwarder(
-        (env["SSH_HOST"], int(env["SSH_PORT"])),
-        ssh_username=env["SSH_USER"],
-        ssh_pkey=env["SSH_PEM_PATH"],
-        remote_bind_address=(env["DB_HOST"], int(env["DB_PORT"])),
-    ) as tunnel:
-        conn = psycopg2.connect(
-            host="127.0.0.1",
-            port=tunnel.local_bind_port,
-            dbname=env["DB_NAME"],
-            user=env["DB_USER"],
-            password=env["DB_PASSWORD"],
-        )
+    with connect_db(env) as conn:
         try:
             cur = conn.cursor()
             query = "SELECT id, word FROM mim_terms ORDER BY id"
@@ -174,7 +197,7 @@ def main() -> None:
 
             print(f"완료: {updated}/{len(rows)}건 업데이트, 실패 단어: {failed_words}")
         finally:
-            conn.close()
+            pass
 
 
 if __name__ == "__main__":
