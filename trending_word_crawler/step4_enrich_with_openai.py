@@ -167,16 +167,16 @@ def enrich_words(input_path, output_path, model, body_limit, max_retries, retry_
 
 def main():
     parser = argparse.ArgumentParser(
-        description="yuhaengo_final_test.json을 OpenAI API로 뜻/감성 분석하여 저장합니다."
+        description="yuhaengo_final.json을 OpenAI API로 뜻/감성 분석하여 저장합니다."
     )
     parser.add_argument(
         "--input",
-        default="yuhaengo_final_test.json",
+        default="yuhaengo_final.json",
         help="입력 JSON 경로",
     )
     parser.add_argument(
         "--output",
-        default="yuhaengo_enriched_test.json",
+        default="yuhaengo_enriched.json",
         help="출력 JSON 경로",
     )
     parser.add_argument(
