@@ -180,13 +180,16 @@ def main() -> None:
                 ratios = word_to_ratios.get(word)
                 if ratios is None:
                     continue
+                recent = sum(ratios[-30:]) / 30
+                prev   = sum(ratios[-60:-30]) / 30
+                trend_score = round(recent - prev, 1)
                 cur.execute(
                     """
                     UPDATE mim_terms
-                    SET search_ratios_90d = %s, search_trend_updated_at = now()
+                    SET search_ratios_90d = %s, trend_score = %s, search_trend_updated_at = now()
                     WHERE id = %s
                     """,
-                    (ratios, row_id),
+                    (ratios, trend_score, row_id),
                 )
                 updated += 1
             conn.commit()
