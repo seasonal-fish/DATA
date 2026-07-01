@@ -1,101 +1,187 @@
+import os
 import time
-import pandas as pd
+from pathlib import Path
+
+import psycopg2
+from bs4 import BeautifulSoup
+from dotenv import dotenv_values
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
-from bs4 import BeautifulSoup
 
-def crawl_careet_dictionary():
+if not hasattr(__import__("paramiko"), "DSSKey"):
+    import paramiko
+    paramiko.DSSKey = paramiko.RSAKey
+
+from sshtunnel import SSHTunnelForwarder
+
+_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+LOGIN_URL = "https://www.careet.net/user/login"
+DICTIONARY_URL = "https://www.careet.net/Dictionary"
+LAST_PAGE = 69
+
+
+def load_env() -> dict:
+    env = {**dotenv_values(_ENV_PATH), **os.environ}
+    missing = [k for k in ("CAREET_EMAIL", "CAREET_PASSWORD") if not env.get(k)]
+    if missing:
+        raise RuntimeError(f".env에 다음 값이 없습니다: {missing}")
+    if not env.get("DATABASE_URL"):
+        required = ["SSH_HOST", "SSH_PORT", "SSH_USER", "SSH_PEM_PATH",
+                    "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+        missing = [k for k in required if not env.get(k)]
+        if missing:
+            raise RuntimeError(f"DATABASE_URL이 없고 SSH 접속 정보도 부족합니다: {missing}")
+    return env
+
+
+def connect_db(env: dict):
+    if env.get("DATABASE_URL"):
+        return psycopg2.connect(env["DATABASE_URL"]), None
+
+    tunnel = SSHTunnelForwarder(
+        (env["SSH_HOST"], int(env["SSH_PORT"])),
+        ssh_username=env["SSH_USER"],
+        ssh_pkey=env["SSH_PEM_PATH"],
+        remote_bind_address=(env["DB_HOST"], int(env["DB_PORT"])),
+    )
+    tunnel.start()
+    conn = psycopg2.connect(
+        host="127.0.0.1",
+        port=tunnel.local_bind_port,
+        dbname=env["DB_NAME"],
+        user=env["DB_USER"],
+        password=env["DB_PASSWORD"],
+    )
+    return conn, tunnel
+
+
+def upsert_terms(conn, rows: list[dict]):
+    sql = """
+        INSERT INTO public.mim_terms (word, definition)
+        VALUES (%(word)s, %(definition)s)
+        ON CONFLICT (word) DO UPDATE SET
+            definition = EXCLUDED.definition;
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    conn.commit()
+
+
+def build_driver():
     options = webdriver.ChromeOptions()
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+
+def login(driver, email: str, password: str):
+    driver.get(LOGIN_URL)
+    wait = WebDriverWait(driver, 15)
+
+    email_input = wait.until(EC.presence_of_element_located(
+        (By.CSS_SELECTOR, "input[type='email'], input[name='email'], input[id='email']")
+    ))
+    email_input.clear()
+    email_input.send_keys(email)
+
+    driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(password)
+    driver.find_element(By.CSS_SELECTOR, "button[type='submit'], input[type='submit']").click()
 
     try:
-        # 1. 로그인
-        print("💡 브라우저가 열렸습니다. 60초 안에 직접 로그인을 완료해주세요.")
-        driver.get("https://www.careet.net/user/login")
-        time.sleep(60)
+        wait.until(EC.url_changes(LOGIN_URL))
+    except TimeoutException:
+        raise RuntimeError("로그인 실패: 이메일/비밀번호를 확인하세요.")
 
-        # 2. 딕셔너리 페이지 이동
-        print("💡 딕셔너리 페이지로 이동합니다...")
-        driver.get("https://www.careet.net/Dictionary")
-        time.sleep(5)
+    print(f"로그인 성공 (현재 URL: {driver.current_url})")
 
-        dictionary_data = []
-        current_page = 1
 
-        print("💡 1페이지부터 69페이지까지만 데이터 수집을 시작합니다...")
+def crawl_pages(driver) -> list[dict]:
+    driver.get(DICTIONARY_URL)
+    time.sleep(5)
 
-        # 3. 페이지를 넘겨가며 반복 수집
-        while True:
-            # 현재 페이지 데이터 파싱
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            items = soup.select('li.footnote-key__item') 
+    results = []
+    current_page = 1
+    print(f"1페이지부터 {LAST_PAGE}페이지까지 수집 시작...")
 
-            page_count = 0
-            for item in items:
-                try:
-                    title = item.select_one('em.footnote-key').text.strip()
-                    description = item.select_one('p.text').text.strip()
-                    dictionary_data.append({'단어': title, '뜻': description})
-                    page_count += 1
-                except AttributeError:
-                    continue 
-            
-            print(f"✅ {current_page}페이지 수집 완료! (수집된 단어: {page_count}개 / 누적: {len(dictionary_data)}개)")
-
-            # ⭐ 🎯 [추가된 부분] 69페이지까지 다 긁었으면 반복문을 빠져나갑니다.
-            if current_page == 69:
-                print(f"🏁 목표한 69페이지까지 모두 수집 완료하여 종료합니다.")
-                break
-
-            # 4. 다음 페이지 번호 클릭 로직
-            next_page = current_page + 1
+    while True:
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        page_count = 0
+        for item in soup.select('li.footnote-key__item'):
             try:
-                # 다음 페이지 번호에 해당하는 버튼(a 태그)을 찾습니다.
-                next_btn_xpath = f"//div[contains(@class, 'pagination')]//a[normalize-space(text())='{next_page}']"
-                next_button = driver.find_element(By.XPATH, next_btn_xpath)
-                
-                # 버튼이 있는 곳으로 화면을 부드럽게 스크롤
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_button)
-                time.sleep(1) 
-                
-                # 자바스크립트로 다음 페이지 클릭
-                driver.execute_script("arguments[0].click();", next_button)
-                time.sleep(3) # 다음 페이지가 로딩될 때까지 대기
-                
+                word = item.select_one('em.footnote-key').text.strip()
+                definition = item.select_one('p.text').text.strip()
+                results.append({'word': word, 'definition': definition})
+                page_count += 1
+            except AttributeError:
+                continue
+
+        print(f"{current_page}페이지 완료 (이번: {page_count}개 / 누적: {len(results)}개)")
+
+        if current_page == LAST_PAGE:
+            print(f"{LAST_PAGE}페이지까지 수집 완료.")
+            break
+
+        next_page = current_page + 1
+        try:
+            next_btn = driver.find_element(
+                By.XPATH,
+                f"//div[contains(@class, 'pagination')]//a[normalize-space(text())='{next_page}']"
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
+            time.sleep(1)
+            driver.execute_script("arguments[0].click();", next_btn)
+            time.sleep(3)
+            current_page = next_page
+
+        except NoSuchElementException:
+            try:
+                arrow = driver.find_element(
+                    By.XPATH,
+                    "//div[contains(@class, 'pagination')]//a[contains(@class, 'next') or contains(text(), '>')]"
+                )
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", arrow)
+                time.sleep(1)
+                driver.execute_script("arguments[0].click();", arrow)
+                time.sleep(3)
                 current_page = next_page
 
             except NoSuchElementException:
-                # 다음 번호가 당장 안 보인다면 화살표(다음 블록) 버튼 클릭 시도
-                try:
-                    next_arrow = driver.find_element(By.XPATH, "//div[contains(@class, 'pagination')]//a[contains(@class, 'next') or contains(text(), '>')]")
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_arrow)
-                    time.sleep(1)
-                    driver.execute_script("arguments[0].click();", next_arrow)
-                    time.sleep(3)
-                    
-                    current_page = next_page
+                print(f"마지막 페이지 도달. ({current_page}페이지)")
+                break
 
-                except NoSuchElementException:
-                    # 번호도 없고 화살표도 없다면 끝 페이지인 것으로 간주
-                    print(f"🏁 더 이상 넘어갈 페이지가 없어 수집을 종료합니다. (현재 {current_page}페이지)")
-                    break
+    return results
 
-        # 5. CSV 파일로 저장
-        if dictionary_data:
-            df = pd.DataFrame(dictionary_data)
-            df.to_csv("careet_dictionary_69.csv", index=False, encoding="utf-8-sig")
-            print(f"🎉 성공! 총 {len(dictionary_data)}개의 단어를 'careet_dictionary_69.csv' 파일로 저장했습니다.")
-        else:
-            print("⚠️ 데이터를 추출하지 못했습니다.")
 
-    except Exception as e:
-        print(f"에러가 발생했습니다: {e}")
+def crawl_careet_dictionary():
+    env = load_env()
 
+    driver = build_driver()
+    try:
+        login(driver, env["CAREET_EMAIL"], env["CAREET_PASSWORD"])
+        rows = crawl_pages(driver)
     finally:
         driver.quit()
+
+    if not rows:
+        print("수집된 데이터가 없습니다.")
+        return
+
+    conn, tunnel = connect_db(env)
+    try:
+        upsert_terms(conn, rows)
+        print(f"DB 저장 완료: {len(rows)}건 -> public.mim_terms")
+    finally:
+        conn.close()
+        if tunnel:
+            tunnel.stop()
+
 
 if __name__ == "__main__":
     crawl_careet_dictionary()

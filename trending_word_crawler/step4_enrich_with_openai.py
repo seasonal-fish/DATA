@@ -1,14 +1,16 @@
 import argparse
 import json
+import mimetypes
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import boto3
 from openai import OpenAI
 from dotenv import load_dotenv
 
 
-# 스크립트가 trending_word_crawler/ 안에 있으므로 상위 Data/.env 를 명시적으로 로드
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
@@ -21,6 +23,37 @@ def load_json(path):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def build_s3_client():
+    kwargs = {}
+    endpoint_url = os.getenv("S3_ENDPOINT_URL", "").strip()
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    region = os.getenv("AWS_DEFAULT_REGION", "").strip()
+    if region:
+        kwargs["region_name"] = region
+    return boto3.client("s3", **kwargs)
+
+
+def download_from_s3(bucket: str, prefix: str, run_id: str, filename: str, dest: Path):
+    s3 = build_s3_client()
+    normalized = prefix.strip("/")
+    key = f"{normalized}/{run_id}/{filename}" if normalized else f"{run_id}/{filename}"
+    print(f"S3 다운로드: s3://{bucket}/{key} -> {dest}")
+    s3.download_file(bucket, key, str(dest))
+
+
+def upload_to_s3(bucket: str, prefix: str, run_id: str, file_path: Path):
+    s3 = build_s3_client()
+    normalized = prefix.strip("/")
+    key = f"{normalized}/{run_id}/{file_path.name}" if normalized else f"{run_id}/{file_path.name}"
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    s3.upload_file(
+        str(file_path), bucket, key,
+        ExtraArgs={"ContentType": content_type or "application/octet-stream"}
+    )
+    print(f"S3 업로드 완료: {file_path.name} -> s3://{bucket}/{key}")
 
 
 def normalize_sentiment(label):
@@ -92,10 +125,7 @@ def call_openai_for_word(client, model, word_item, body_limit):
     except (TypeError, ValueError):
         confidence = 0.0
 
-    if confidence < 0.0:
-        confidence = 0.0
-    if confidence > 1.0:
-        confidence = 1.0
+    confidence = max(0.0, min(1.0, confidence))
 
     return {
         "meaning": str(parsed.get("meaning", "")).strip(),
@@ -167,18 +197,11 @@ def enrich_words(input_path, output_path, model, body_limit, max_retries, retry_
 
 def main():
     parser = argparse.ArgumentParser(
-        description="yuhaengo_final.json을 OpenAI API로 뜻/감성 분석하여 저장합니다."
+        description="S3에서 yuhaengo_final.json을 읽어 OpenAI API로 뜻/감성 분석 후 S3에 저장합니다."
     )
-    parser.add_argument(
-        "--input",
-        default="yuhaengo_final.json",
-        help="입력 JSON 경로",
-    )
-    parser.add_argument(
-        "--output",
-        default="yuhaengo_enriched.json",
-        help="출력 JSON 경로",
-    )
+    parser.add_argument("--input", default="yuhaengo_final.json", help="입력 JSON 경로")
+    parser.add_argument("--output", default="yuhaengo_enriched.json", help="출력 JSON 경로")
+    parser.add_argument("--run-id", default="", help="S3 경로에 사용할 실행 ID")
     parser.add_argument(
         "--model",
         default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -213,7 +236,19 @@ def main():
 
     input_path = Path(args.input)
     output_path = Path(args.output)
+    run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     limit = args.limit if args.limit > 0 else None
+
+    bucket = os.getenv("S3_BUCKET", "").strip()
+
+    # S3에서 입력 파일 다운로드
+    if bucket and args.run_id.strip():
+        raw_prefix = os.getenv("S3_RAW_PREFIX", "trending-word/raw")
+        download_from_s3(bucket, raw_prefix, run_id, input_path.name, input_path)
+    else:
+        if not input_path.exists():
+            raise FileNotFoundError(f"{input_path} 없음. --run-id를 지정하거나 로컬 파일을 확인하세요.")
+        print(f"로컬 파일 사용: {input_path}")
 
     enrich_words(
         input_path=input_path,
@@ -224,6 +259,11 @@ def main():
         retry_wait=args.retry_wait,
         limit=limit,
     )
+
+    # S3에 결과 업로드
+    if bucket:
+        enriched_prefix = os.getenv("S3_ENRICHED_PREFIX", "trending-word/enriched")
+        upload_to_s3(bucket, enriched_prefix, run_id, output_path)
 
     print(f"완료: {output_path}")
 
