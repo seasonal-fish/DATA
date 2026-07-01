@@ -38,7 +38,7 @@ python mim/get_mim_data.py
 - `word` + `definition` upsert (나머지 컬럼은 다른 프로세스가 채움)
 - 필요 env: `CAREET_EMAIL`, `CAREET_PASSWORD`, DB 접속 정보
 
-**`sync_search_trend.py`** — `mim_terms` 테이블의 단어들을 네이버 데이터랩 API로 조회해 최근 7일 평균 검색 비율을 업데이트합니다.
+**`sync_search_trend.py`** — `mim_terms` 테이블의 단어들을 네이버 데이터랩 API로 조회해 최근 90일 일별 검색 비율을 업데이트합니다.
 
 ```bash
 python mim/sync_search_trend.py
@@ -57,8 +57,6 @@ python mim/sync_search_trend.py --limit 5   # 테스트용
 python news/crawl_urls.py https://example.com/article1
 python news/crawl_urls.py --url-file urls.txt
 ```
-
-자세한 사용법은 [news/README.md](news/README.md) 참고.
 
 **`summarize_descriptions.py`** — JSONL 기사 본문을 OpenAI API로 요약합니다.
 
