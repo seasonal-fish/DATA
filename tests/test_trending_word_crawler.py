@@ -15,8 +15,8 @@ from trending_word_crawler.step1_get_word_list import apply_word_limit
 from trending_word_crawler.step2_crawl_descriptions import extract_body_text, extract_section_text
 from trending_word_crawler.step3_save_final import clean_text
 from trending_word_crawler.step4_enrich_with_openai import normalize_sentiment, parse_json_from_text
-from trending_word_crawler.step5_upload_to_s3 import guess_content_type
-from trending_word_crawler.step6_load_enriched_to_db import chunked
+from trending_word_crawler.step3_save_final import guess_content_type
+from trending_word_crawler.step5_load_enriched_to_db import chunked
 
 
 # ---------------------------------------------------------------------------

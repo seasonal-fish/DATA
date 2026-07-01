@@ -1,8 +1,10 @@
 import argparse
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
+import boto3
 from dotenv import load_dotenv
 from psycopg import connect
 from psycopg.sql import SQL, Identifier
@@ -20,6 +22,25 @@ def load_json(path: Path):
 def chunked(items, size):
     for index in range(0, len(items), size):
         yield items[index:index + size]
+
+
+def build_s3_client():
+    kwargs = {}
+    endpoint_url = os.getenv("S3_ENDPOINT_URL", "").strip()
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    region = os.getenv("AWS_DEFAULT_REGION", "").strip()
+    if region:
+        kwargs["region_name"] = region
+    return boto3.client("s3", **kwargs)
+
+
+def download_from_s3(bucket: str, prefix: str, run_id: str, filename: str, dest: Path):
+    s3 = build_s3_client()
+    normalized = prefix.strip("/")
+    key = f"{normalized}/{run_id}/{filename}" if normalized else f"{run_id}/{filename}"
+    print(f"S3 다운로드: s3://{bucket}/{key} -> {dest}")
+    s3.download_file(bucket, key, str(dest))
 
 
 def ensure_table(conn, schema: str, table: str):
@@ -66,9 +87,24 @@ def upsert_rows(conn, schema: str, table: str, rows, batch_size: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="yuhaengo_enriched.json 결과를 DB에 적재합니다.")
+    parser = argparse.ArgumentParser(description="S3에서 yuhaengo_enriched.json을 읽어 DB에 적재합니다.")
     parser.add_argument("--input", default="yuhaengo_enriched.json", help="입력 JSON 경로")
+    parser.add_argument("--run-id", default="", help="S3 경로에 사용할 실행 ID")
     args = parser.parse_args()
+
+    input_path = Path(args.input).resolve()
+    run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    bucket = os.getenv("S3_BUCKET", "").strip()
+
+    # S3에서 입력 파일 다운로드
+    if bucket and args.run_id.strip():
+        enriched_prefix = os.getenv("S3_ENRICHED_PREFIX", "trending-word/enriched")
+        download_from_s3(bucket, enriched_prefix, run_id, input_path.name, input_path)
+    else:
+        if not input_path.exists():
+            raise FileNotFoundError(f"{input_path} 없음. --run-id를 지정하거나 로컬 파일을 확인하세요.")
+        print(f"로컬 파일 사용: {input_path}")
 
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
@@ -78,7 +114,6 @@ def main():
     table = os.getenv("DB_TABLE", "trending_word_enriched").strip() or "trending_word_enriched"
     batch_size = int(os.getenv("DB_BATCH_SIZE", "100"))
 
-    input_path = Path(args.input).resolve()
     data = load_json(input_path)
     rows = data.get("words", [])
 
