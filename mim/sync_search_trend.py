@@ -1,12 +1,12 @@
 """mim_terms 테이블의 단어들에 대해 네이버 데이터랩 검색어트렌드 API로
-최근 7일간의 일별 검색 비율(ratio) 평균을 구해 DB에 반영한다.
+최근 90일간의 일별 검색 비율(ratio) 리스트를 DB에 반영한다.
 
 DB는 SSH 터널(베스천 서버)을 통해서만 접근 가능한 RDS PostgreSQL이므로
 sshtunnel로 로컬 포트를 RDS:5432로 포워딩한 뒤 psycopg2로 접속한다.
 
 주의: 데이터랩 API는 절대 검색량이 아니라 0~100으로 정규화된 상대 비율이다.
 한 번의 호출에 최대 5개 키워드그룹만 묶이고, 정규화 기준(=100)이 호출마다
-달라지므로 avg_search_ratio_7d 값은 같은 단어의 시계열 추세를 보는 용도이며
+달라지므로 search_ratios_90d 값은 같은 단어의 시계열 추세를 보는 용도이며
 단어 간 절대 비교에는 쓸 수 없다.
 
 사용:
@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
-import statistics
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -92,9 +91,11 @@ def connect_db(env: dict):
             conn.close()
 
 
-def fetch_batch_averages(
+def fetch_ratios(
     client: httpx.Client, headers: dict, words: list[str], start_date: str, end_date: str
-) -> dict[str, float | None]:
+) -> dict[str, list[float]]:
+    """90일치 일별 ratio 리스트 반환. 인덱스 0 = start_date, 마지막 = end_date.
+    API가 검색량 없는 날을 생략하므로 빠진 날은 0.0으로 채운다."""
     payload = {
         "startDate": start_date,
         "endDate": end_date,
@@ -102,9 +103,6 @@ def fetch_batch_averages(
         "keywordGroups": [{"groupName": w, "keywords": [w]} for w in words],
     }
 
-    # 데이터랩은 검색량이 거의 없는 날은 데이터 포인트를 생략한다(0으로 채워주지 않음).
-    # 누락된 날을 그냥 빼고 평균을 내면 검색량이 적을수록 평균이 더 높게 나오는
-    # 왜곡이 생기므로, 빠진 날은 ratio=0으로 채워서 항상 전체 기간으로 나눈다.
     start_d = date.fromisoformat(start_date)
     end_d = date.fromisoformat(end_date)
     all_periods = [(start_d + timedelta(days=i)).isoformat() for i in range((end_d - start_d).days + 1)]
@@ -115,12 +113,11 @@ def fetch_batch_averages(
             response = client.post(DATALAB_URL, json=payload, headers=headers)
             if response.status_code == 200:
                 data = response.json()
-                averages: dict[str, float | None] = {}
+                result: dict[str, list[float]] = {}
                 for item in data.get("results", []):
                     by_period = {p["period"]: p["ratio"] for p in item.get("data", [])}
-                    ratios = [by_period.get(period, 0.0) for period in all_periods]
-                    averages[item["title"]] = round(statistics.mean(ratios), 2)
-                return averages
+                    result[item["title"]] = [round(by_period.get(period, 0.0)) for period in all_periods]
+                return result
             if response.status_code in (429, 500, 502, 503, 504):
                 last_error = RuntimeError(f"HTTP {response.status_code}: {response.text}")
                 time.sleep(2 * attempt)
@@ -141,9 +138,9 @@ def main() -> None:
     env = load_env()
 
     end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=6)
+    start = end - timedelta(days=89)  # 90일치
     start_date, end_date = start.isoformat(), end.isoformat()
-    print(f"조회 기간: {start_date} ~ {end_date} (최근 7일)")
+    print(f"조회 기간: {start_date} ~ {end_date} (최근 90일)")
 
     naver_headers = {
         "X-Naver-Client-Id": env["NAVER_CLIENT_ID"],
@@ -161,17 +158,16 @@ def main() -> None:
             rows = cur.fetchall()  # [(id, word), ...]
             print(f"대상 행: {len(rows)}")
 
-            # 같은 단어가 여러 id에 중복될 수 있으므로 단어 기준으로 1회만 조회
             unique_words = sorted({word for _, word in rows})
-            word_to_avg: dict[str, float | None] = {}
+            word_to_ratios: dict[str, list[float]] = {}
             failed_words: list[str] = []
 
             with httpx.Client(timeout=10.0) as client:
                 for i in range(0, len(unique_words), BATCH_SIZE):
                     batch = unique_words[i : i + BATCH_SIZE]
                     try:
-                        word_to_avg.update(
-                            fetch_batch_averages(client, naver_headers, batch, start_date, end_date)
+                        word_to_ratios.update(
+                            fetch_ratios(client, naver_headers, batch, start_date, end_date)
                         )
                     except RuntimeError as exc:
                         print(f"  실패: {batch} -> {exc}")
@@ -181,16 +177,19 @@ def main() -> None:
 
             updated = 0
             for row_id, word in rows:
-                avg_ratio = word_to_avg.get(word)
-                if avg_ratio is None:
+                ratios = word_to_ratios.get(word)
+                if ratios is None:
                     continue
+                recent = sum(ratios[-30:]) / 30
+                prev   = sum(ratios[-60:-30]) / 30
+                trend_score = round(recent - prev, 1)
                 cur.execute(
                     """
                     UPDATE mim_terms
-                    SET avg_search_ratio_7d = %s, search_trend_updated_at = now()
+                    SET search_ratios_90d = %s, trend_score = %s, search_trend_updated_at = now()
                     WHERE id = %s
                     """,
-                    (avg_ratio, row_id),
+                    (ratios, trend_score, row_id),
                 )
                 updated += 1
             conn.commit()
